@@ -1,0 +1,325 @@
+diff --git a/keyboards/nuphy/air60_v2/ansi/ansi.c b/keyboards/nuphy/air60_v2/ansi/ansi.c
+index 26cd476..e2640f2 100644
+--- a/keyboards/nuphy/air60_v2/ansi/ansi.c
++++ b/keyboards/nuphy/air60_v2/ansi/ansi.c
+@@ -16,6 +16,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+ 
+ #include "ansi.h"
++#include "battery_report.h"
++#include "enye.h"
+ #include "usb_main.h"
+ #include "rf_driver.h"
+ 
+@@ -405,6 +407,9 @@ bool process_record_kb(uint16_t keycode, keyrecord_t *record) {
+         return false;
+     }
+     no_act_time = 0;
++    if (!process_enye(keycode, record)) {
++        return false;
++    }
+     switch (keycode) {
+         case RF_DFU:
+             if (record->event.pressed) {
+@@ -628,6 +633,7 @@ bool process_record_kb(uint16_t keycode, keyrecord_t *record) {
+         case BAT_SHOW:
+             if (record->event.pressed) {
+                 f_bat_hold = !f_bat_hold;
++                battery_report_request();
+             }
+             return false;
+ 
+@@ -653,6 +659,7 @@ bool process_record_kb(uint16_t keycode, keyrecord_t *record) {
+         case BAT_NUM:
+             if (record->event.pressed) {
+                 f_bat_num_show = 1;
++                battery_report_request();
+             } else {
+                 f_bat_num_show = 0;
+             }
+@@ -766,6 +773,8 @@ void housekeeping_task_kb(void)
+ 
+     dev_sts_sync();
+ 
++    battery_report_task();
++
+     long_press_key();
+ 
+     dial_sw_scan();
+diff --git a/keyboards/nuphy/air60_v2/ansi/battery_report.c b/keyboards/nuphy/air60_v2/ansi/battery_report.c
+new file mode 100644
+index 0000000..c122947
+--- /dev/null
++++ b/keyboards/nuphy/air60_v2/ansi/battery_report.c
+@@ -0,0 +1,118 @@
++// Copyright 2026 Jose Padron
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "ansi.h"
++#include "host.h"
++#include "timer.h"
++#include "battery_report.h"
++
++// Minimum time between sends triggered by a battery level change.
++#ifndef BATTERY_REPORT_CHANGE_INTERVAL_MS
++#    define BATTERY_REPORT_CHANGE_INTERVAL_MS 60000
++#endif
++
++// Minimum time between sends triggered by a request (key press, reconnect).
++#ifndef BATTERY_REPORT_REQUEST_INTERVAL_MS
++#    define BATTERY_REPORT_REQUEST_INTERVAL_MS 2000
++#endif
++
++// Charger plug state must be stable this long before it is reported (connector bounce).
++#ifndef BATTERY_REPORT_CHARGE_DEBOUNCE_MS
++#    define BATTERY_REPORT_CHARGE_DEBOUNCE_MS 1000
++#endif
++
++// Delay after the link connects so the RF status sync can refresh the level.
++#ifndef BATTERY_REPORT_SETTLE_MS
++#    define BATTERY_REPORT_SETTLE_MS 3000
++#endif
++
++extern DEV_INFO_STRUCT dev_info;
++extern bool            f_goto_sleep;
++extern bool            f_wakeup_prepare;
++
++void uart_send_report(uint8_t report_type, uint8_t *report_buf, uint8_t report_size);
++
++static bool     pending       = true;
++static bool     was_connected = false;
++static uint16_t last_sent     = 0;
++static uint32_t last_send_time;
++static uint32_t connect_time;
++static bool     reported_charging = false;
++static bool     charge_changing   = false;
++static uint32_t charge_change_time;
++
++void battery_report_request(void) {
++    pending = true;
++}
++
++static bool charger_connected(void) {
++    return dev_info.rf_charge & 0x01;
++}
++
++// Plugging or unplugging the charger is reported right away, not after the change interval.
++static void track_charger(void) {
++    if (charger_connected() == reported_charging) {
++        charge_changing = false;
++        return;
++    }
++    if (!charge_changing) {
++        charge_changing    = true;
++        charge_change_time = timer_read32();
++    } else if (timer_elapsed32(charge_change_time) >= BATTERY_REPORT_CHARGE_DEBOUNCE_MS) {
++        charge_changing   = false;
++        reported_charging = charger_connected();
++        pending           = true;
++    }
++}
++
++static uint16_t battery_report_value(void) {
++    uint8_t pct = dev_info.rf_baterry;
++    if (pct > 100) pct = 100;
++    return (reported_charging ? BATTERY_REPORT_CHARGING : BATTERY_REPORT_DISCHARGING) | pct;
++}
++
++static void send_consumer_usage(uint16_t usage) {
++    uint8_t buf[2] = {usage & 0xFF, usage >> 8};
++    // Call uart_send_report directly: the uart_send_*_report wrappers reset
++    // no_act_time, which would keep the keyboard from going to sleep.
++    uart_send_report(CMD_RPT_CONSUME, buf, sizeof(buf));
++}
++
++void battery_report_task(void) {
++    bool connected = (dev_info.link_mode == LINK_RF_24) && (dev_info.rf_state == RF_CONNECT);
++
++    if (!connected) {
++        was_connected = false;
++        return;
++    }
++    if (!was_connected) {
++        was_connected = true;
++        connect_time      = timer_read32();
++        pending           = true;
++        reported_charging = charger_connected();
++        charge_changing   = false;
++    }
++
++    track_charger();
++
++    // Never send while asleep or waking up, and never cut a held media key.
++    if (f_goto_sleep || f_wakeup_prepare) return;
++    if (timer_elapsed32(connect_time) < BATTERY_REPORT_SETTLE_MS) return;
++    if (host_last_consumer_usage() != 0) return;
++
++    uint16_t value = battery_report_value();
++    uint32_t since = timer_elapsed32(last_send_time);
++
++    if (pending) {
++        if (last_sent != 0 && since < BATTERY_REPORT_REQUEST_INTERVAL_MS) return;
++    } else {
++        if (value == last_sent || since < BATTERY_REPORT_CHANGE_INTERVAL_MS) return;
++    }
++
++    send_consumer_usage(value);
++    send_consumer_usage(0);
++
++    pending        = false;
++    last_sent      = value;
++    last_send_time = timer_read32();
++}
+diff --git a/keyboards/nuphy/air60_v2/ansi/battery_report.h b/keyboards/nuphy/air60_v2/ansi/battery_report.h
+new file mode 100644
+index 0000000..9bcc132
+--- /dev/null
++++ b/keyboards/nuphy/air60_v2/ansi/battery_report.h
+@@ -0,0 +1,29 @@
++// Copyright 2026 Jose Padron
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++/*
++ * Battery report over the 2.4G dongle.
++ *
++ * The stock RF link never carries the battery level to the host. This module
++ * sends it as a consumer report whose usage is outside the descriptor logical
++ * range (1..0x2A0), so the host OS ignores it as a key while hidraw readers
++ * still receive it:
++ *
++ *   usage = BATTERY_REPORT_DISCHARGING | pct   (0x0300..0x0364)
++ *   usage = BATTERY_REPORT_CHARGING    | pct   (0x0400..0x0464)
++ *
++ * followed by a 0x0000 release.
++ */
++
++#define BATTERY_REPORT_DISCHARGING 0x0300
++#define BATTERY_REPORT_CHARGING    0x0400
++
++#ifdef BATTERY_REPORT_ENABLE
++void battery_report_task(void);
++void battery_report_request(void);
++#else
++static inline void battery_report_task(void) {}
++static inline void battery_report_request(void) {}
++#endif
+diff --git a/keyboards/nuphy/air60_v2/ansi/enye.c b/keyboards/nuphy/air60_v2/ansi/enye.c
+new file mode 100644
+index 0000000..a04e693
+--- /dev/null
++++ b/keyboards/nuphy/air60_v2/ansi/enye.c
+@@ -0,0 +1,59 @@
++// Copyright 2026 Jose Padron
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "enye.h"
++
++// Fn layers of the stock keymap: 1 on the Mac side of the switch, 4 on the Windows side.
++#define FN_LAYER_MAC 1
++#define FN_LAYER_WIN 4
++
++// Pause between the simulated key events. IBus shows "u00f1" until the final Space,
++// so the shorter the whole sequence, the less of it is ever drawn on screen. The rest
++// of the keyboard keeps the stock TAP_CODE_DELAY.
++#ifndef ENYE_TAP_DELAY_MS
++#    define ENYE_TAP_DELAY_MS 2
++#endif
++
++static void tap_fast(uint16_t keycode) {
++    register_code16(keycode);
++    wait_ms(ENYE_TAP_DELAY_MS);
++    unregister_code16(keycode);
++    wait_ms(ENYE_TAP_DELAY_MS);
++}
++
++// Linux Unicode input: Ctrl+Shift+U, hex code point, Space. ñ = U+00F1, Ñ = U+00D1.
++// The hex digits and the closing Space go out in a single report: Linux emits the keys
++// of one report in usage order (F 0x09 / D 0x07, 1 0x1E, Space 0x2C), which is exactly
++// the order IBus needs, so nothing is left on screen between the digits and the Space.
++static void type_enye(bool upper) {
++    const uint8_t tail[] = {upper ? KC_D : KC_F, KC_1, KC_SPACE};
++
++    uint8_t mods      = get_mods();
++    uint8_t weak_mods = get_weak_mods();
++    clear_mods();
++    clear_weak_mods();
++    send_keyboard_report();
++
++    tap_fast(LCTL(LSFT(KC_U)));
++
++    for (uint8_t i = 0; i < sizeof(tail); i++) add_key(tail[i]);
++    send_keyboard_report();
++    wait_ms(ENYE_TAP_DELAY_MS);
++    for (uint8_t i = 0; i < sizeof(tail); i++) del_key(tail[i]);
++    send_keyboard_report();
++    wait_ms(ENYE_TAP_DELAY_MS);
++
++    set_mods(mods);
++    set_weak_mods(weak_mods);
++    send_keyboard_report();
++}
++
++bool process_enye(uint16_t keycode, keyrecord_t *record) {
++    if (keycode != KC_N || !(IS_LAYER_ON(FN_LAYER_MAC) || IS_LAYER_ON(FN_LAYER_WIN))) {
++        return true;
++    }
++    if (record->event.pressed) {
++        type_enye((get_mods() & MOD_MASK_SHIFT) || host_keyboard_led_state().caps_lock);
++    }
++    return false;
++}
+diff --git a/keyboards/nuphy/air60_v2/ansi/enye.h b/keyboards/nuphy/air60_v2/ansi/enye.h
+new file mode 100644
+index 0000000..1b49621
+--- /dev/null
++++ b/keyboards/nuphy/air60_v2/ansi/enye.h
+@@ -0,0 +1,25 @@
++// Copyright 2026 Jose Padron
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include "quantum.h"
++
++/*
++ * Fn + N types ñ (Ñ with Shift or Caps Lock) on a US host layout.
++ *
++ * The keyboard can only send key codes, so it types the Linux Unicode input
++ * sequence (Ctrl+Shift+U, code point, Space), which IBus turns into the letter.
++ * The sequence uses a short pause per key (ENYE_TAP_DELAY_MS) so the intermediate
++ * "u00f1" is not drawn; the rest of the keyboard keeps its stock timing.
++ * It is hooked in process_record_kb instead of the keymap because VIA keeps the
++ * keymap in EEPROM and only reloads keymap.c when the build date changes.
++ */
++
++#ifdef ENYE_ENABLE
++bool process_enye(uint16_t keycode, keyrecord_t *record);
++#else
++static inline bool process_enye(uint16_t keycode, keyrecord_t *record) {
++    return true;
++}
++#endif
+diff --git a/keyboards/nuphy/air60_v2/ansi/rules.mk b/keyboards/nuphy/air60_v2/ansi/rules.mk
+index f2f5e22..2cee233 100644
+--- a/keyboards/nuphy/air60_v2/ansi/rules.mk
++++ b/keyboards/nuphy/air60_v2/ansi/rules.mk
+@@ -1,3 +1,17 @@
+ SRC += side.c rf.c sleep.c rf_driver.c
+ UART_DRIVER_REQUIRED = yes
+ 
++
++# Send the battery level to the host over the 2.4G dongle (see battery_report.h).
++BATTERY_REPORT_ENABLE ?= yes
++ifeq ($(strip $(BATTERY_REPORT_ENABLE)), yes)
++    SRC += battery_report.c
++    OPT_DEFS += -DBATTERY_REPORT_ENABLE
++endif
++
++# Fn + N types ñ through the Linux Unicode input sequence (see enye.h).
++ENYE_ENABLE ?= yes
++ifeq ($(strip $(ENYE_ENABLE)), yes)
++    SRC += enye.c
++    OPT_DEFS += -DENYE_ENABLE
++endif
